@@ -37,6 +37,12 @@ pub trait DeviceKeyStore: Send + Sync {
         ))
     }
 
+    fn ensure_encrypt_key(&self, key_id: &str) -> Result<()> {
+        Err(DeviceKeyStoreError::Unsupported(
+            "ensure_encrypt_key not implemented for this backend",
+        ))
+    }
+
     /// Probe whether hardware security is actually usable on this device/runtime.
     fn is_hardware_security_available(&self) -> Result<bool>;
 

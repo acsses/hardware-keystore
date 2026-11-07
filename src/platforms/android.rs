@@ -15,6 +15,19 @@ const EC_CURVE_P256: &str = "secp256r1";
 const SIGNATURE_ALGORITHM: &str = "SHA256withECDSA";
 const PROBE_KEY_ID: &str = "hardware_probe";
 
+const VERSION: u8 = 0x01;
+const POINT_LEN: usize = 65;
+const NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
+const MIN_LEN: usize = 1 + POINT_LEN + NONCE_LEN + TAG_LEN;
+
+/// P-256 の SubjectPublicKeyInfo ヘッダ（この後ろに 65 byte の非圧縮点が続く）
+const SPKI_P256_PREFIX: [u8; 26] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+    0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+];
+
+
 #[derive(Debug, Default)]
 pub struct AndroidHardwareKeyStore;
 
@@ -318,6 +331,182 @@ impl AndroidHardwareKeyStore {
         Ok(())
     }
 
+    fn generate_encrypt_key<'a>(
+        &self,
+        env: &mut JNIEnv<'a>,
+        activity: &JObject<'a>,
+        alias: &str,
+        attestation_challenge: Option<&[u8]>,
+    ) -> Result<()> {
+        let kpg_class = env
+            .find_class("java/security/KeyPairGenerator")
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let algorithm = self.jstring(env, EC_ALGORITHM)?;
+        let provider = self.jstring(env, ANDROID_KEYSTORE)?;
+        let algorithm_obj: JObject = algorithm.into();
+        let provider_obj: JObject = provider.into();
+
+        let kpg = env
+            .call_static_method(
+                kpg_class,
+                "getInstance",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/KeyPairGenerator;",
+                &[
+                    JValue::Object(&algorithm_obj),
+                    JValue::Object(&provider_obj),
+                ],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let keyprops = env
+            .find_class("android/security/keystore/KeyProperties")
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let purpose_agree_key = env
+            .get_static_field(&keyprops, "PURPOSE_AGREE_KEY", "I")
+            .and_then(|v| v.i())
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+        
+        let purposes = purpose_agree_key;
+
+        let builder_class = env
+            .find_class("android/security/keystore/KeyGenParameterSpec$Builder")
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let alias_j = self.jstring(env, alias)?;
+        let alias_obj: JObject = alias_j.into();
+
+        let mut builder = env
+            .new_object(
+                builder_class,
+                "(Ljava/lang/String;I)V",
+                &[JValue::Object(&alias_obj), JValue::Int(purposes)],
+            )
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let digest_sha256 = env
+            .get_static_field(&keyprops, "DIGEST_SHA256", "Ljava/lang/String;")
+            .and_then(|v| v.l())
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let string_class = env
+            .find_class("java/lang/String")
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+        let digest_array = env
+            .new_object_array(1, string_class, JObject::null())
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+        env.set_object_array_element(&digest_array, 0, digest_sha256)
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let digest_array_obj: JObject = digest_array.into();
+        builder = env
+            .call_method(
+                &builder,
+                "setDigests",
+                "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+                &[JValue::Object(&digest_array_obj)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let ec_spec_class = env
+            .find_class("java/security/spec/ECGenParameterSpec")
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+        let curve_name = self.jstring(env, EC_CURVE_P256)?;
+        let curve_name_obj: JObject = curve_name.into();
+        let ec_spec = env
+            .new_object(
+                ec_spec_class,
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&curve_name_obj)],
+            )
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        builder = env
+            .call_method(
+                &builder,
+                "setAlgorithmParameterSpec",
+                "(Ljava/security/spec/AlgorithmParameterSpec;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+                &[JValue::Object(&ec_spec)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        builder = env
+            .call_method(
+                &builder,
+                "setUserAuthenticationRequired",
+                "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+                &[JValue::Bool(0)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let sdk_int = self.get_sdk_int(env)?;
+        if let Some(challenge) = attestation_challenge {
+            if !challenge.is_empty() {
+                if sdk_int < 24 {
+                    return Err(DeviceKeyStoreError::Backend(
+                        "android api level does not support key attestation challenge".to_string(),
+                    ));
+                }
+                let challenge_j = env
+                    .byte_array_from_slice(challenge)
+                    .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+                let challenge_obj: JObject = challenge_j.into();
+                builder = env
+                    .call_method(
+                        &builder,
+                        "setAttestationChallenge",
+                        "([B)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+                        &[JValue::Object(&challenge_obj)],
+                    )
+                    .and_then(|v| v.l())
+                    .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+            }
+        }
+
+        if sdk_int >= 28
+            && self.has_system_feature(env, activity, "android.hardware.strongbox_keystore")?
+        {
+            let maybe_builder = env.call_method(
+                &builder,
+                "setIsStrongBoxBacked",
+                "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+                &[JValue::Bool(1)],
+            );
+
+            if let Ok(next) = maybe_builder.and_then(|v| v.l()) {
+                builder = next;
+            }
+        }
+
+        let spec = env
+            .call_method(
+                &builder,
+                "build",
+                "()Landroid/security/keystore/KeyGenParameterSpec;",
+                &[],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        env.call_method(
+            &kpg,
+            "initialize",
+            "(Ljava/security/spec/AlgorithmParameterSpec;)V",
+            &[JValue::Object(&spec)],
+        )
+        .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        env.call_method(&kpg, "generateKeyPair", "()Ljava/security/KeyPair;", &[])
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        Ok(())
+    }
+
     fn ensure_key_inner<'a>(
         &self,
         env: &mut JNIEnv<'a>,
@@ -337,6 +526,107 @@ impl AndroidHardwareKeyStore {
                 "key generation completed but alias not found".to_string(),
             ))
         }
+    }
+
+    fn ensure_encrypt_key_inner<'a>(
+        &self,
+        env: &mut JNIEnv<'a>,
+        activity: &JObject<'a>,
+        alias: &str,
+    ) -> Result<()> {
+        if self.contains_alias(env, alias)? {
+            return Ok(());
+        }
+
+        self.generate_encrypt_key(env, activity, alias, None)?;
+
+        if self.contains_alias(env, alias)? {
+            Ok(())
+        } else {
+            Err(DeviceKeyStoreError::Backend(
+                "key generation completed but alias not found".to_string(),
+            ))
+        }
+    }
+
+    fn keystore_ecdh<'a>(
+        env: &mut JNIEnv<'a>,
+        alias: &str,
+        eph_sec1: &[u8],
+    ) -> Result<Vec<u8>> {
+
+        let private_key = self.get_private_key(env, &alias)?;
+        // 65 byte 点 → X.509 SPKI → PublicKey
+        // 65 byte 点 → X.509 SPKI → PublicKey
+        let mut spki = Vec::with_capacity(SPKI_P256_PREFIX.len() + POINT_LEN);
+        spki.extend_from_slice(&SPKI_P256_PREFIX);
+        spki.extend_from_slice(eph_sec1);
+        let spki_j = env.byte_array_from_slice(&spki).map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let spec = env
+            .new_object(
+                "java/security/spec/X509EncodedKeySpec",
+                "([B)V",
+                &[JValue::Object(&spki_j)],
+            )
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let ec = env.new_string("EC").map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+        let kf = env
+            .call_static_method(
+                "java/security/KeyFactory",
+                "getInstance",
+                "(Ljava/lang/String;)Ljava/security/KeyFactory;",
+                &[JValue::Object(&ec)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let peer_pub = env
+            .call_method(
+                &kf,
+                "generatePublic",
+                "(Ljava/security/spec/KeySpec;)Ljava/security/PublicKey;",
+                &[JValue::Object(&spec)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        // KeyAgreement.getInstance("ECDH", "AndroidKeyStore")
+        let alg = env.new_string("ECDH").map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+        let prov = env.new_string("AndroidKeyStore").map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+        let ka = env
+            .call_static_method(
+                "javax/crypto/KeyAgreement",
+                "getInstance",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyAgreement;",
+                &[JValue::Object(&alg), JValue::Object(&prov)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        env.call_method(&ka, "init", "(Ljava/security/Key;)V", &[JValue::Object(&private_key)])
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        env.call_method(
+            &ka,
+            "doPhase",
+            "(Ljava/security/Key;Z)Ljava/security/Key;",
+            &[JValue::Object(&peer_pub), JValue::Bool(1)],
+        )
+        .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+
+        let secret = env
+            .call_method(&ka, "generateSecret", "()[B", &[])
+            .and_then(|v| v.l())
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+        if secret.is_null() {
+            return Err(DeviceKeyStoreError::Backend("generateSecret returned null"));
+        }
+        let bytes = env
+            .convert_byte_array(JByteArray::from(secret))
+            .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
+        Ok(bytes)
     }
 
     fn delete_alias_inner<'a>(&self, env: &mut JNIEnv<'a>, alias: &str) -> Result<()> {
@@ -762,6 +1052,27 @@ impl DeviceKeyStore for AndroidHardwareKeyStore {
 
         let alias = Self::key_alias(key_id);
         self.with_env_activity(|env, activity| self.ensure_key_inner(env, &activity, &alias))
+    }
+
+    fn ensure_encrypt_key(&self, key_id: &str) -> Result<()> {
+        if key_id.is_empty() {
+            return Err(DeviceKeyStoreError::InvalidInput("empty key_id"));
+        }
+
+        let alias = Self::key_alias(key_id);
+        self.with_env_activity(|env, activity| self.ensure_encrypt_key_inner(env, &activity, &alias))
+    }
+
+    fn encrypt_key_exchange(&self, key_id: &str, payload: &[u8]) -> Result<Vec<u8>> {
+        if key_id.is_empty() {
+            return Err(DeviceKeyStoreError::InvalidInput("empty key_id"));
+        }
+
+        let alias = Self::key_alias(key_id);
+        self.with_env_activity(|env, activity| {
+            self.ensure_encrypt_key_inner(env, &activity, &alias)?;
+            self.keystore_ecdh(env, &alias, payload)
+        })
     }
 
     fn public_key_der(&self, key_id: &str) -> Result<Vec<u8>> {
