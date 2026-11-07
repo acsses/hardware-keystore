@@ -1063,7 +1063,7 @@ impl DeviceKeyStore for AndroidHardwareKeyStore {
         self.with_env_activity(|env, activity| self.ensure_encrypt_key_inner(env, &activity, &alias))
     }
 
-    fn encrypt_key_exchange(&self, key_id: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    fn encrypt_key_exchange(&self, key_id: &str, pk: &[u8]) -> Result<Vec<u8>> {
         if key_id.is_empty() {
             return Err(DeviceKeyStoreError::InvalidInput("empty key_id"));
         }
@@ -1071,7 +1071,7 @@ impl DeviceKeyStore for AndroidHardwareKeyStore {
         let alias = Self::key_alias(key_id);
         self.with_env_activity(|env, activity| {
             self.ensure_encrypt_key_inner(env, &activity, &alias)?;
-            self.keystore_ecdh(env, &alias, payload)
+            self.keystore_ecdh(env, &alias, pk)
         })
     }
 

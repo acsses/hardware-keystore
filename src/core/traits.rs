@@ -43,6 +43,13 @@ pub trait DeviceKeyStore: Send + Sync {
         ))
     }
 
+    fn encrypt_key_exchange(&self, key_id: &str, pk: &[u8]) -> Result<Vec<u8>>{
+        Err(DeviceKeyStoreError::Unsupported(
+            "encrypt_key_exchange not implemented for this backend",
+        ))
+
+    }
+
     /// Probe whether hardware security is actually usable on this device/runtime.
     fn is_hardware_security_available(&self) -> Result<bool>;
 
