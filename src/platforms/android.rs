@@ -550,6 +550,7 @@ impl AndroidHardwareKeyStore {
     }
 
     fn keystore_ecdh<'a>(
+        &self,
         env: &mut JNIEnv<'a>,
         alias: &str,
         eph_sec1: &[u8],
