@@ -621,7 +621,7 @@ impl AndroidHardwareKeyStore {
             .and_then(|v| v.l())
             .map_err(|e| DeviceKeyStoreError::Backend(e.to_string()))?;
         if secret.is_null() {
-            return Err(DeviceKeyStoreError::Backend("generateSecret returned null"));
+            return Err(DeviceKeyStoreError::Backend("generateSecret returned null".to_string()));
         }
         let bytes = env
             .convert_byte_array(JByteArray::from(secret))
